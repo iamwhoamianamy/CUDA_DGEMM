@@ -1,94 +1,47 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 
-#include <cuda_runtime_api.h>
-#include <device_launch_parameters.h>
+#include <thrust/host_vector.h>
+#include <thrust/system/cuda/experimental/pinned_allocator.h>
+#include <thrust/device_vector.h>
+#include <thrust/execution_policy.h>
+#include <thrust/inner_product.h>
 
-typedef float real;
+#include "cuda_kernel_callers.cuh"
 
-#define __all__ __device__ __host__
-
-inline __all__ int flat_id(int i, int j, int height)
-{
-	return j * height + i;
-}
-
-inline __all__ double get_elem(const real* M, int i, int j, int height)
-{
-	return M[flat_id(i, j, height)];
-}
-
-inline __all__ double get_elem(real* M, int i, int j, int height)
-{
-	return get_elem(const_cast<const real*>(M), i, j, height);
-}
-
-inline __all__ void set_elem(real *M, int i, int j, int height, real val)
-{
-	M[flat_id(i, j, height)] = val;
-}
-
-__global__ void cuda_simple_dgemm_kernel(
-   const real* a, const real* b, real* c,
-   size_t M, size_t N, size_t K)
-{
-	real sum = 0;
-	const size_t i = blockDim.y * blockIdx.y + threadIdx.y;
-	const size_t j = blockDim.x * blockIdx.x + threadIdx.x;
-
-	if (i < M && j < N)
-	{
-		for (size_t k = 0; k < K; k++)
-		{
-			sum += get_elem(a, i, k, M) * get_elem(b, k, j, K);
-		}
-
-		set_elem(c, i, j, M, sum);
-	}
-}
-
-inline void cuda_simple_dgemm(
-   const real* a, const real* b, real* c,
-   size_t M, size_t N, size_t K)
-{
-	const size_t thread_per_block_1_dim = 32;
-	dim3 thread_per_block(thread_per_block_1_dim, thread_per_block_1_dim);	
-	dim3 blocks(
-		std::ceil(static_cast<float>(M) / thread_per_block_1_dim),
-		std::ceil(static_cast<float>(N) / thread_per_block_1_dim));
-
-	cuda_simple_dgemm_kernel<<<blocks, thread_per_block>>>(a, b, c, M, N, K);
-}
-
-template <class func>
-float get_execution_time(func function)
-{
-	float time;
-	cudaEvent_t start, stop;
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
-
-	function();
-
-	cudaEventRecord(stop, 0);
-	cudaEventSynchronize(stop);
-	cudaEventElapsedTime(&time, start, stop);
-
-	return time;
-}
-
-void print_matrix(const std::vector<real>& M, int height, int width)
+void print_matrix(const std::vector<real>& matrix, int height, int width)
 {
 	for (size_t i = 0; i < height; i++)
 	{
 		for (size_t j = 0; j < width; j++)
 		{
-			std::cout << get_elem(M.data(), i, j, height) << " ";
+			std::cout << get_elem(matrix.data(), i, j, height) << " ";
 		}
 
 		std::cout << std::endl;
 	}
+}
+
+template <class func>
+std::chrono::milliseconds get_execution_time(func function)
+{
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+
+	cudaEventRecord(start, 0);
+	function();
+	cudaEventRecord(stop, 0);
+
+	cudaEventSynchronize(stop);
+	
+	float time = 0;
+	cudaEventElapsedTime(&time, start, stop);
+
+	return std::chrono::milliseconds(static_cast<size_t>(time));
 }
 
 real get_random_normed()
@@ -96,49 +49,161 @@ real get_random_normed()
 	return static_cast<real>(rand()) / static_cast<real>(RAND_MAX);
 }
 
-const size_t M = 3;
-const size_t N = 2;
-const size_t K = 4;
-
-const size_t a_size = M * K * sizeof(real);
-const size_t b_size = K * N * sizeof(real);
-const size_t c_size = M * N * sizeof(real);
-
-void task_1()
+template <class host_allocator>
+real test_cuda_simple_dgemm_error(size_t m, size_t n, size_t k)
 {
-	std::vector<real> a(M * K);
-	std::vector<real> b(K * N);
-	std::vector<real> c(M * N);
+	thrust::host_vector<real, host_allocator> a(m * k);
+	thrust::host_vector<real, host_allocator> b(k * n);
+	thrust::host_vector<real, host_allocator> c_my(m * n);
+	thrust::host_vector<real, host_allocator> c_cublas(m * n);
 
 	std::generate(a.begin(), a.end(), get_random_normed);
 	std::generate(b.begin(), b.end(), get_random_normed);
 
-	real* dev_a;
-	real* dev_b;
-	real* dev_c;
+	thrust::device_vector<real> dev_a(a);
+	thrust::device_vector<real> dev_b(b);
+	thrust::device_vector<real> dev_c_my(m * n, 0);
+	thrust::device_vector<real> dev_c_cublas(m * n, 0);
 
-	cudaMalloc((void**)&dev_a, a_size);
-	cudaMalloc((void**)&dev_b, b_size);
-	cudaMalloc((void**)&dev_c, c_size);
+	cuda_simple_dgemm(dev_a.data().get(), dev_b.data().get(), dev_c_my.data().get(), m, n, k);
+	cudaDeviceSynchronize();
+
+	cublas_dgemm(dev_a.data().get(), dev_b.data().get(), dev_c_cublas.data().get(), m, n, k);
+	cudaDeviceSynchronize();
+
+	thrust::copy(dev_c_my.begin(), dev_c_my.end(), c_my.begin());
+	thrust::copy(dev_c_cublas.begin(), dev_c_cublas.end(), c_cublas.begin());
+
+	real diff = 0;
+
+	for (size_t i = 0; i < c_my.size(); i++)
+	{
+		diff += std::abs(c_my[i] - c_cublas[i]);
+	}
+
+	return thrust::inner_product(
+		dev_c_my.begin(),
+		dev_c_my.end(), 
+		dev_c_cublas.begin(), 
+		real(0), 
+		thrust::plus<real>(),
+		thrust::minus<real>());
+}
+
+template <class host_allocator, class algorithm>
+std::chrono::milliseconds multiply_matrices(size_t m, size_t n, size_t k, algorithm alg)
+{
+	thrust::host_vector<real, host_allocator> a(m * k);
+	thrust::host_vector<real, host_allocator> b(k * n);
+	thrust::host_vector<real, host_allocator> c(m * n); 
+
+	std::generate(a.begin(), a.end(), get_random_normed);
+	std::generate(b.begin(), b.end(), get_random_normed);
+
+	thrust::device_vector<real> dev_a(m * k);
+	thrust::device_vector<real> dev_b(k * n);
+	thrust::device_vector<real> dev_c(m * n);
 
 	auto test_function = [&]()
 	{
-		cudaMemcpy(dev_a, a.data(), a_size, cudaMemcpyHostToDevice);
-		cudaMemcpy(dev_b, b.data(), b_size, cudaMemcpyHostToDevice);
+		thrust::copy(a.begin(), a.end(), dev_a.begin());
+		thrust::copy(b.begin(), b.end(), dev_b.begin());
 
-		cuda_simple_dgemm(dev_a, dev_b, dev_c, M, N, K);
+		alg(dev_a.data().get(), dev_b.data().get(), dev_c.data().get(), m, n, k);
+		cudaDeviceSynchronize();
 
-		cudaMemcpy(c.data(), dev_c, c_size, cudaMemcpyDeviceToHost);
+		thrust::copy(dev_c.begin(), dev_c.end(), c.begin());
 	};
 
-	std::cout << "Task #1 exec time: " << get_execution_time(test_function) << std::endl;
-	std::cout << "Result matrix: " << std::endl;
-	print_matrix(c, M, N);
+	return get_execution_time(test_function);
 }
 
-int main(int agrc, char** argv)
+namespace thrust
 {
-	task_1();
+	template <class t>
+	using pinned_allocator = thrust::system::cuda::experimental::pinned_allocator<t>;
+}
+
+void run_single_test(size_t m, size_t n, size_t k)
+{
+	auto simple_default_time = multiply_matrices<std::allocator<real>>(m, n, k, cuda_simple_dgemm).count() / 1000.0;
+	auto simple_pinned_time = multiply_matrices<thrust::pinned_allocator<real>>(m, n, k, cuda_simple_dgemm).count() / 1000.0;
+	auto cublas_default_time = multiply_matrices<std::allocator<real>>(m, n, k, cublas_dgemm).count() / 1000.0;
+	auto cublas_pinned_time = multiply_matrices<thrust::pinned_allocator<real>>(m, n, k, cublas_dgemm).count() / 1000.0;
+
+	std::cout << m * n * k << " ";
+	std::cout << simple_default_time << " ";
+	std::cout << simple_pinned_time << " ";
+	std::cout << cublas_default_time << " ";
+	std::cout << cublas_pinned_time << std::endl;
+}
+
+void run_multiple_tests(size_t count)
+{
+	size_t m = 1000;
+	size_t n = 1000;
+	size_t k = 1000;
+
+	const double factor = std::pow(static_cast<double>(2), 1.0 / 3);
+
+	for (size_t i = 0; i < count; i++)
+	{
+		m *= factor;
+		n *= factor;
+		k *= factor;
+
+		run_single_test(m, n, k);
+	}
+}
+
+int main(int argc, char** argv)
+{
+	switch(argc)
+	{
+		case 2:
+		{
+			size_t count;
+
+			try
+			{
+				count = std::atoll(argv[1]);
+				run_multiple_tests(count);
+			}
+			catch(const std::exception& e)
+			{
+				std::cout << "Error on params parsing!" << std::endl;
+				return 1;
+			}
+
+			break;
+		}
+		case 4:
+		{
+			try
+			{
+				size_t m = std::atoll(argv[1]);
+				size_t n = std::atoll(argv[2]);
+				size_t k = std::atoll(argv[3]);
+				run_single_test(m, n, k);
+			}
+			catch(const std::exception& e)
+			{
+				std::cout << "Error on params parsing!" << std::endl;
+				return 1;
+			}
+
+			break;
+		}
+		default:
+		{
+			std::cout << "Provide:" << std::endl;
+			std::cout << "	1 param - count of tests" << std::endl;
+			std::cout << "or:" << std::endl;
+			std::cout << "	3 params - m n k" << std::endl;
+
+			return 1;
+		}
+	}
 
 	return 0;
 }

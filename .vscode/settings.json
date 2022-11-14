@@ -71,6 +71,7 @@
 		"mutex": "cpp",
 		"set": "cpp",
 		"stop_token": "cpp",
-		"thread": "cpp"
+		"thread": "cpp",
+		"*.cu": "cpp",
 	}
 }
